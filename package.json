@@ -1,0 +1,39 @@
+{
+  "name": "system-design-project",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "lint": "oxlint",
+    "preview": "vite preview",
+    "test": "npx tsx test-simulator.ts",
+    "test:cache": "npx tsx test-flag-cache.ts",
+    "test:backend": "npx tsx test-backend-local.ts",
+    "test:perf": "npx tsx test-performance-load.ts",
+    "server:local": "npx tsx backend/local/server.ts",
+    "build:lambda": "esbuild backend/aws/src/handlers/*.ts --platform=node --target=node24 --outdir=backend/aws/src/handlers --format=cjs"
+  },
+  "dependencies": {
+    "@tailwindcss/vite": "^4.3.3",
+    "clsx": "^2.1.1",
+    "lucide-react": "^1.55.0",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8",
+    "tailwind-merge": "^3.7.0",
+    "tailwindcss": "^4.3.3",
+    "ws": "^8.22.1"
+  },
+  "devDependencies": {
+    "@types/node": "^24.13.3",
+    "@types/react": "^19.2.18",
+    "@types/react-dom": "^19.2.7",
+    "@types/ws": "^8.18.2",
+    "@vitejs/plugin-react": "^6.1.1",
+    "oxlint": "^1.81.0",
+    "tsx": "^4.23.15",
+    "typescript": "~6.0.2",
+    "vite": "^8.3.0"
+  }
+}

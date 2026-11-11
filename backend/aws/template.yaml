@@ -1,0 +1,344 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  PS 28: Low-Latency Distributed Feature Flag Service Virtual Lab (AWS SAM)
+  Optimized for AWS Academy Learner Lab (Serverless, Zero-Cost Idle, LabRole integration, Least-Privilege Scoping)
+
+Parameters:
+  UseLearnerLabRole:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Set to true if deploying in an AWS Academy Learner Lab to use the pre-created LabRole.
+  LabRoleArn:
+    Type: String
+    Default: ''
+    Description: Explicit ARN for LabRole (if empty and UseLearnerLabRole is true, defaults to arn:aws:iam::<account>:role/LabRole).
+  LambdaRuntime:
+    Type: String
+    Default: 'nodejs24.x'
+    AllowedValues: ['nodejs22.x', 'nodejs24.x']
+    Description: Node.js runtime for Lambda functions (nodejs24.x or nodejs22.x).
+  AdminApiKey:
+    Type: String
+    NoEcho: true
+    MinLength: 8
+    Description: Shared secret header (x-admin-key) required for mutating feature flags via POST toggle (minimum 8 characters).
+  CorsAllowedOrigin:
+    Type: String
+    Default: '*'
+    Description: Allowed CORS Origin header (e.g. http://localhost:5173 or *).
+
+Conditions:
+  IsLearnerLab: !Equals [!Ref UseLearnerLabRole, 'true']
+  HasCustomLabRole: !Not [!Equals [!Ref LabRoleArn, '']]
+
+Globals:
+  Function:
+    Timeout: 10
+    MemorySize: 256
+    Runtime: !Ref LambdaRuntime
+    LoggingConfig:
+      LogFormat: JSON
+
+Resources:
+  # ============================================================================
+  # 1. CLOUD CONFIGURATION STORAGE: Amazon DynamoDB
+  # ============================================================================
+  FeatureFlagsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: ps28-feature-flags
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: flagId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: flagId
+          KeyType: HASH
+
+  ConnectionsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: ps28-websocket-connections
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: connectionId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: connectionId
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  # ============================================================================
+  # 2. PUB/SUB BROKER: Amazon SNS Topic
+  # ============================================================================
+  FeatureFlagUpdatesTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: ps28-flag-updates-topic
+
+  # ============================================================================
+  # 3. HTTP REST API: Amazon API Gateway HTTP API
+  # ============================================================================
+  FlagHttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      CorsConfiguration:
+        AllowMethods:
+          - GET
+          - POST
+          - OPTIONS
+        AllowOrigins:
+          - !Ref CorsAllowedOrigin
+        AllowHeaders:
+          - Content-Type
+          - Authorization
+          - x-admin-key
+        MaxAge: 600
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: 50
+        ThrottlingRateLimit: 25
+
+  # ============================================================================
+  # 4. LAMBDA FUNCTIONS: REST Handlers
+  # ============================================================================
+  GetFlagFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/handlers/
+      Handler: getFlag.handler
+      Role: !If [IsLearnerLab, !If [HasCustomLabRole, !Ref LabRoleArn, !Sub 'arn:aws:iam::${AWS::AccountId}:role/LabRole'], !Ref 'AWS::NoValue']
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref FeatureFlagsTable
+      Environment:
+        Variables:
+          FLAGS_TABLE: !Ref FeatureFlagsTable
+      Events:
+        GetFlag:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref FlagHttpApi
+            Path: /api/flags/{flagId}
+            Method: GET
+        GetFlagOptions:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref FlagHttpApi
+            Path: /api/flags/{flagId}
+            Method: OPTIONS
+
+  UpdateFlagFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/handlers/
+      Handler: updateFlag.handler
+      Role: !If [IsLearnerLab, !If [HasCustomLabRole, !Ref LabRoleArn, !Sub 'arn:aws:iam::${AWS::AccountId}:role/LabRole'], !Ref 'AWS::NoValue']
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref FeatureFlagsTable
+        - SNSPublishMessagePolicy:
+            TopicName: !GetAtt FeatureFlagUpdatesTopic.TopicName
+      Environment:
+        Variables:
+          FLAGS_TABLE: !Ref FeatureFlagsTable
+          SNS_TOPIC_ARN: !Ref FeatureFlagUpdatesTopic
+          ADMIN_API_KEY: !Ref AdminApiKey
+      Events:
+        UpdateFlag:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref FlagHttpApi
+            Path: /api/flags/{flagId}/toggle
+            Method: POST
+        UpdateFlagOptions:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref FlagHttpApi
+            Path: /api/flags/{flagId}/toggle
+            Method: OPTIONS
+
+  # ============================================================================
+  # 5. WEBSOCKET REAL-TIME GATEWAY: API Gateway WebSocket API
+  # ============================================================================
+  FlagWebSocketApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: ps28-flag-websocket-api
+      ProtocolType: WEBSOCKET
+      RouteSelectionExpression: "$request.body.action"
+
+  ConnectRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref FlagWebSocketApi
+      RouteKey: $connect
+      AuthorizationType: NONE
+      OperationName: ConnectRoute
+      Target: !Join
+        - '/'
+        - - 'integrations'
+          - !Ref ConnectIntegration
+
+  ConnectIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref FlagWebSocketApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${WsConnectFunction.Arn}/invocations'
+
+  DisconnectRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref FlagWebSocketApi
+      RouteKey: $disconnect
+      AuthorizationType: NONE
+      OperationName: DisconnectRoute
+      Target: !Join
+        - '/'
+        - - 'integrations'
+          - !Ref DisconnectIntegration
+
+  DisconnectIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref FlagWebSocketApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${WsDisconnectFunction.Arn}/invocations'
+
+  WebSocketDeployment:
+    Type: AWS::ApiGatewayV2::Deployment
+    DependsOn:
+      - ConnectRoute
+      - DisconnectRoute
+    Properties:
+      ApiId: !Ref FlagWebSocketApi
+
+  WebSocketStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      StageName: prod
+      Description: Production WebSocket Stage
+      DeploymentId: !Ref WebSocketDeployment
+      ApiId: !Ref FlagWebSocketApi
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: 100
+        ThrottlingRateLimit: 50
+
+  # ============================================================================
+  # 6. LAMBDA FUNCTIONS: WebSocket Handlers & SNS Subscriber Broadcast
+  # ============================================================================
+  WsConnectFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/handlers/
+      Handler: wsConnect.handler
+      Role: !If [IsLearnerLab, !If [HasCustomLabRole, !Ref LabRoleArn, !Sub 'arn:aws:iam::${AWS::AccountId}:role/LabRole'], !Ref 'AWS::NoValue']
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ConnectionsTable
+      Environment:
+        Variables:
+          CONNECTIONS_TABLE: !Ref ConnectionsTable
+
+  WsDisconnectFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/handlers/
+      Handler: wsDisconnect.handler
+      Role: !If [IsLearnerLab, !If [HasCustomLabRole, !Ref LabRoleArn, !Sub 'arn:aws:iam::${AWS::AccountId}:role/LabRole'], !Ref 'AWS::NoValue']
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ConnectionsTable
+      Environment:
+        Variables:
+          CONNECTIONS_TABLE: !Ref ConnectionsTable
+
+  WsBroadcastFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/handlers/
+      Handler: wsBroadcast.handler
+      Role: !If [IsLearnerLab, !If [HasCustomLabRole, !Ref LabRoleArn, !Sub 'arn:aws:iam::${AWS::AccountId}:role/LabRole'], !Ref 'AWS::NoValue']
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ConnectionsTable
+        - Statement:
+            - Effect: Allow
+              Action:
+                - 'execute-api:ManageConnections'
+              Resource: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${FlagWebSocketApi}/*'
+      Environment:
+        Variables:
+          CONNECTIONS_TABLE: !Ref ConnectionsTable
+          WEBSOCKET_ENDPOINT: !Sub 'https://${FlagWebSocketApi}.execute-api.${AWS::Region}.amazonaws.com/prod'
+      Events:
+        SnsBroadcastEvent:
+          Type: SNS
+          Properties:
+            Topic: !Ref FeatureFlagUpdatesTopic
+
+  # Least-Privilege Scoped Lambda Permissions for API Gateway WebSockets
+  WsConnectPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref WsConnectFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${FlagWebSocketApi}/*/$connect'
+
+  WsDisconnectPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref WsDisconnectFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${FlagWebSocketApi}/*/$disconnect'
+
+  # CloudWatch Log Groups with 3-Day Retention to prevent log cost accumulation
+  GetFlagLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${GetFlagFunction}'
+      RetentionInDays: 3
+
+  UpdateFlagLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${UpdateFlagFunction}'
+      RetentionInDays: 3
+
+  WsConnectLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${WsConnectFunction}'
+      RetentionInDays: 3
+
+  WsDisconnectLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${WsDisconnectFunction}'
+      RetentionInDays: 3
+
+  WsBroadcastLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${WsBroadcastFunction}'
+      RetentionInDays: 3
+
+Outputs:
+  HttpApiUrl:
+    Description: HTTP API Gateway endpoint for Feature Flag Service
+    Value: !Sub 'https://${FlagHttpApi}.execute-api.${AWS::Region}.amazonaws.com'
+  WebSocketApiUrl:
+    Description: WebSocket API Gateway endpoint for real-time push
+    Value: !Sub 'wss://${FlagWebSocketApi}.execute-api.${AWS::Region}.amazonaws.com/prod'
+  DynamoDBTableName:
+    Description: DynamoDB Feature Flags Table
+    Value: !Ref FeatureFlagsTable
+  SnsTopicArn:
+    Description: SNS Feature Flag Updates Topic ARN
+    Value: !Ref FeatureFlagUpdatesTopic
